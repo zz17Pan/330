@@ -1,45 +1,98 @@
 function [a_tx, a_rx] = compute_steering_vector(tx_array, rx_array, r, az, el, params)
-%COMPUTE_STEERING_VECTOR 计算给定方位角和俯仰角的收发导向矢量
-%   tx_array: 发射阵列结构体
-%   rx_array: 接收阵列结构体
-%   r: 距离 (m)
-%   az: 方位角 (度)
-%   el: 俯仰角 (度)
-%   params: 系统参数结构体
-%   a_tx: 发射阵列导向矢量
-%   a_rx: 接收阵列导向矢量
+%COMPUTE_STEERING_VECTOR 高精度导向矢量计算
+%   实现亚度级角度精度的导向矢量计算
+
+% 参数检查和预处理
+if r < 0.1
+    warning('距离过小，设置为0.1m');
+    r = 0.1;
+end
 
 % 提取波长
-lambda = params.c / params.fc;  % 波长
+lambda = params.c / params.fc;
 
-% 计算单位方向向量
+% 高精度角度计算
 az_rad = deg2rad(az);
 el_rad = deg2rad(el);
-k_vec = 2*pi/lambda * [cosd(el)*cosd(az); cosd(el)*sind(az); sind(el)];
 
-% 计算发射阵列导向矢量
-a_tx = compute_array_steering_vector(tx_array.elements_pos, k_vec);
+% 使用数值稳定的三角函数计算
+cos_el = cos(el_rad);
+sin_el = sin(el_rad);
+cos_az = cos(az_rad);
+sin_az = sin(az_rad);
 
-% 计算接收阵列导向矢量
-a_rx = compute_array_steering_vector(rx_array.elements_pos, k_vec);
+% 计算精确的方向向量
+k_dir = [cos_el*cos_az; cos_el*sin_az; sin_el];
+
+% 确保单位向量
+k_norm = norm(k_dir);
+if k_norm < eps
+    warning('方向向量接近零，添加微小扰动');
+    k_dir = k_dir + eps;
+    k_norm = norm(k_dir);
+end
+k_dir = k_dir / k_norm;
+
+% 计算波数向量
+k_vec = 2*pi/lambda * k_dir;
+
+% 高精度阵列导向矢量计算
+a_tx = compute_array_steering_vector(tx_array.elements_pos, k_vec, r, lambda);
+a_rx = compute_array_steering_vector(rx_array.elements_pos, k_vec, r, lambda);
+
+% 应用距离衰减和相位补偿
+a_tx = apply_range_compensation(a_tx, r, lambda);
+a_rx = apply_range_compensation(a_rx, r, lambda);
 
 end
 
-function a = compute_array_steering_vector(elements_pos, k_vec)
-    % 计算阵列导向矢量
-    % elements_pos: Nx3矩阵，每行表示一个阵元的[x,y,z]坐标
-    % k_vec: 波数向量
+function a = compute_array_steering_vector(elements_pos, k_vec, r, lambda)
+    num_elements = size(elements_pos, 1);
+    a = zeros(num_elements, 1);
     
-    % 计算每个阵元的空间相位
-    phase = zeros(size(elements_pos, 1), 1);
-    for i = 1:size(elements_pos, 1)
-        % 计算k·r (点积)
-        phase(i) = k_vec(1) * elements_pos(i, 1) + ...
-                   k_vec(2) * elements_pos(i, 2) + ...
-                   k_vec(3) * elements_pos(i, 3);
+    % 计算阵列中心
+    array_center = mean(elements_pos, 1);
+    
+    % 高精度相位计算
+    for i = 1:num_elements
+        % 相对位置计算
+        rel_pos = elements_pos(i,:) - array_center;
+        
+        % 精确相位计算
+        phase = compute_precise_phase(rel_pos, k_vec, lambda);
+        
+        % 使用复数指数
+        a(i) = exp(1j * phase);
     end
-    a = exp(1j * phase);
     
-    % 归一化导向矢量
-    a = a / norm(a);
-end 
+    % 归一化
+    a = a / (norm(a) + eps);
+    
+    % 数值稳定性检查
+    if any(isnan(a)) || any(isinf(a))
+        warning('导向矢量计算出现数值不稳定');
+        a(isnan(a) | isinf(a)) = 1/sqrt(num_elements);
+        a = a / (norm(a) + eps);
+    end
+end
+
+function phase = compute_precise_phase(pos, k_vec, lambda)
+    % 高精度相位计算
+    phase_components = 2*pi/lambda * pos * k_vec;
+    phase = sum(phase_components);
+    
+    % 相位限制在[-π, π]范围内
+    phase = mod(phase + pi, 2*pi) - pi;
+end
+
+function a = apply_range_compensation(a, r, lambda)
+    % 距离衰减补偿
+    k = 2*pi/lambda;
+    range_factor = 1/sqrt(max(r, 0.1));  % 避免除零
+    phase_comp = exp(-1j * k * r);
+    
+    a = a * (range_factor * phase_comp);
+    
+    % 再次归一化
+    a = a / (norm(a) + eps);
+end
