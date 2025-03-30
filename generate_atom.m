@@ -1,63 +1,66 @@
 function atom = generate_atom(a_tx, a_rx, range, params)
-%GENERATE_ATOM 为OMP稀疏重建算法生成字典原子
-%   a_tx: 发射阵列导向矢量
-%   a_rx: 接收阵列导向矢量
-%   range: 距离 (m)
-%   params: 系统参数结构体
-%   atom: 生成的字典原子
+%GENERATE_ATOM 高精度字典原子生成
+%   实现高精度的FMCW信号模型
 
 % 提取参数
-c = params.c;                 % 光速
-lambda = params.c / params.fc; % 波长
-fs = params.fmcw.fs;          % 采样率
-sweep_rate = params.fmcw.mu;  % 调频率 (B/T)
+c = params.c;
+fc = params.fc;
+lambda = c / fc;
+fs = params.fmcw.fs;
+sweep_rate = params.fmcw.mu;
 
-% 计算时延（往返传播）
+% 精确时延计算
 tau = 2 * range / c;
 
 % 计算拍频
 beat_freq = sweep_rate * tau;
 
-% 获取当前信号长度 - 从额外传入的参数或从params中获取
-% 检查是否有信号长度参数
+% 获取当前信号长度
 if isfield(params, 'current_signal_length')
-    % 如果传入了当前实际信号长度，使用此长度
     signal_length = params.current_signal_length;
 else
-    % 否则使用默认的采样点数
     signal_length = params.fmcw.Ns;
 end
 
-% 计算采样时间向量 - 使用实际信号长度
-t = (0:signal_length-1)' / fs;  % 采样时间向量，列向量
+% 高精度时间向量
+t = (0:signal_length-1)' / fs;
 
-% 标准FMCW信号相位项：2π(f_c*τ + 0.5*μ*τ^2 - μ*τ*t)
-% 其中第一项是载波相位偏移，第二项是频率调制引起的相位偏移，第三项是拍频导致的相位变化
-phase = 2*pi * (beat_freq * t);
+% 完整的FMCW信号相位计算
+% 1. 载波相位
+carrier_phase = 2*pi * fc * tau;
+% 2. 调频引起的相位
+chirp_phase = pi * sweep_rate * tau^2;
+% 3. 拍频相位
+beat_phase = 2*pi * beat_freq * t;
 
-% 基于拍频和接收信号模型生成字典原子
-num_chirps = params.fmcw.num_chirps;
-num_rx = length(a_rx);
+% 总相位
+phase = carrier_phase + chirp_phase - beat_phase;
 
-% 内存优化：原子向量只存储一次，然后重塑
-% 使用导向矢量生成完整的字典原子
+% 生成基础信号
 atom_base = exp(1j * phase);
 
-% 应用FMCW信号模型：接收信号 = a_rx' * H * a_tx * s(t-τ)
-% 这里H是信道矩阵，对简单的单路径模型，我们近似为exp(-j*2π*fc*τ)
+% 应用天线阵列因子
+array_factor = (a_rx' * a_tx);
 
-% 计算标准化因子
+% 生成完整原子
+atom = atom_base * array_factor;
+
+% 信号归一化
 norm_factor = 1 / sqrt(length(atom_base));
+atom = atom * norm_factor;
 
-% 生成最终的原子，重塑为列向量
-atom = atom_base(:) * norm_factor;
-
-% 确保atom是列向量
+% 确保列向量格式
 if size(atom, 2) > size(atom, 1)
     atom = atom';
 end
 
-% 验证原子长度与期望一致
-%fprintf('生成原子，长度 = %d\n', length(atom));
+% 验证信号长度
+if length(atom) ~= signal_length
+    if length(atom) > signal_length
+        atom = atom(1:signal_length);
+    else
+        atom = [atom; zeros(signal_length-length(atom), 1)];
+    end
+end
 
-end 
+end
