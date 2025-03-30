@@ -106,6 +106,7 @@ target.phase = 1;  % 当前运动阶段
 total_timer = tic;
 frame_times = zeros(1, num_frames);
 
+%% 主循环续（接上文）
 for frame_idx = 1:num_frames
     frame_timer = tic;
     fprintf('\n处理帧 %d/%d...\n', frame_idx, num_frames);
@@ -223,7 +224,8 @@ for frame_idx = 1:num_frames
         % 设置搜索范围为预测值周围3个标准差
         prior_cov = diag([range_var, azimuth_var, elevation_var]);
         
-        fprintf('卡尔曼滤波预测: 距离=%.2f m, 方位角=%.2f°, 俯仰角=%.2f°\n', prior_info.range, prior_info.azimuth, prior_info.elevation);
+        fprintf('卡尔曼滤波预测: 距离=%.2f m, 方位角=%.2f°, 俯仰角=%.2f°\n', ...
+                prior_info.range, prior_info.azimuth, prior_info.elevation);
         
         % 生成发射信号
         tx_signal = generate_fmcw(params);
@@ -244,176 +246,127 @@ for frame_idx = 1:num_frames
         % 距离多普勒处理
         [rd_cube, range_axis, velocity_axis] = range_doppler_processing(rx_signal, params);
         
-        % 为OMP算法准备额外参数
+        % 准备OMP参数
         params_omp = params;
-        params_omp.omp.max_iter = 3;  % 减少迭代次数以提高速度
-        
+        params_omp.frame_idx = frame_idx;
+        params_omp.frame_interval = params.sim.frame_interval;
+
+        % 添加目标状态信息
+        params_omp.target_state.position = rx_pos;
+        params_omp.target_state.velocity = target.vel;
+        params_omp.target_state.acceleration = target.acc;
+
+        % 添加平台状态信息
+        params_omp.platform_state.position = [0, 0, 0];
+        params_omp.platform_state.velocity = [0, 0, 0];
+        params_omp.platform_state.acceleration = [0, 0, 0];
+
+        % 添加动态阵列参数
+        params_omp.dynamic_array.enabled = true;
+        params_omp.dynamic_array.range_threshold = 100;
+
+        % 添加大气衰减参数
+        params_omp.atmosphere.attenuation_db_per_km = 0.1;
+
+        % 添加运动学约束
+        params_omp.motion_constraints.max_range_rate = max_speed;
+        params_omp.motion_constraints.max_angle_rate = 20;
+        params_omp.motion_constraints.max_range_accel = 10;
+        params_omp.motion_constraints.max_angle_accel = 10;
+
+        % 添加运动相关参数
+        if frame_idx > 1
+            params_omp.motion.prev_range = results(frame_idx-1).est(1);
+            params_omp.motion.prev_azimuth = results(frame_idx-1).est(2);
+            params_omp.motion.prev_elevation = results(frame_idx-1).est(3);
+            
+            if frame_idx > 2
+                dr1 = results(frame_idx-1).est(1) - results(frame_idx-2).est(1);
+                dr2 = results(frame_idx-2).est(1) - results(frame_idx-3).est(1);
+                params_omp.motion.range_trend = (dr1 + dr2) / (2 * params.sim.frame_interval);
+                
+                daz1 = wrapTo180(results(frame_idx-1).est(2) - results(frame_idx-2).est(2));
+                daz2 = wrapTo180(results(frame_idx-2).est(2) - results(frame_idx-3).est(2));
+                params_omp.motion.azimuth_trend = (daz1 + daz2) / (2 * params.sim.frame_interval);
+                
+                del1 = results(frame_idx-1).est(3) - results(frame_idx-2).est(3);
+                del2 = results(frame_idx-2).est(3) - results(frame_idx-3).est(3);
+                params_omp.motion.elevation_trend = (del1 + del2) / (2 * params.sim.frame_interval);
+            end
+        end
+
+        % 设置估计质量控制参数
+        range_threshold = max(1.5, 0.08 * prior_info.range);
+        az_threshold = 5.0;
+        params_omp.quality_control.range_threshold = range_threshold;
+        params_omp.quality_control.angle_threshold = az_threshold;
+        params_omp.quality_control.max_innovation = 5.0;
+
         % CFAR检测，获取距离和速度
         [detected_range, detected_velocity] = cfar_detection(rd_cube, range_axis, velocity_axis, params, prior_info.range);
         
         % 使用CFAR结果作为先验距离
         if ~isempty(detected_range)
-            % 将检测到的单个距离值赋给先验
-            prior_info.range = detected_range;
-            
-            % 选取与当前处理峰值对应的采样点范围
-            peak_idx = round(prior_info.range * 2 * params.fmcw.mu / params.c * params.fmcw.fs);
-            peak_idx = max(1, min(peak_idx, size(rx_signal, 1)-1));  % 确保索引有效
-            
-            % 保存CFAR检测结果到参数中，供OMP使用
-            params_omp.detection = struct('range', detected_range, 'velocity', detected_velocity);
-            
+            params_omp.measurements.cfar_range = detected_range;
+            params_omp.measurements.cfar_velocity = detected_velocity;
+            params_omp.measurements.has_cfar = true;
             fprintf('CFAR检测: 距离=%.2f m, 速度=%.2f m/s\n', detected_range, detected_velocity);
         else
             fprintf('CFAR检测: 未检测到有效目标\n');
-            params_omp.detection = struct('range', [], 'velocity', []);
+            params_omp.measurements.has_cfar = false;
         end
-        
+
         % OMP稀疏重建 - 结合优化的先验信息
         [est_range, est_azimuth, est_elevation] = prior_guided_omp(rx_signal, tx_array, rx_array, prior_info, prior_cov, params_omp);
-        fprintf('OMP估计结果: 距离=%.2f m, 方位角=%.2f°, 俯仰角=%.2f°\n', est_range, est_azimuth, est_elevation);
         
-        % 检查OMP结果与预测值之间的差异，如过大则降低权重
+        fprintf('OMP估计结果: 距离=%.2f m, 方位角=%.2f°, 俯仰角=%.2f°\n', ...
+                est_range, est_azimuth, est_elevation);
+
+        % 检查估计结果与预测值之间的差异
         range_diff = abs(est_range - prior_info.range);
         az_diff = abs(wrapTo180(est_azimuth - prior_info.azimuth));
-        el_diff = abs(wrapTo180(est_elevation - prior_info.elevation));
-        
-        % 根据实际测量情况设置更有针对性的阈值
-        range_threshold = max(1.5, 0.08 * prior_info.range);  % 更严格的动态距离阈值
-        az_threshold = 5.0;  % 降低方位角阈值
-        el_threshold = 5.0;  % 降低俯仰角阈值
-        
-        % 设置异常检测标志
-        measurement_anomaly = false;
-        
-        % 检查并处理距离异常
-        if range_diff > range_threshold
-            measurement_anomaly = true;
-            fprintf('警告: 距离估计与预测差异过大(%.2f > %.2f)，调整处理\n', range_diff, range_threshold);
-            
-            % 检查是否可能使用CFAR结果代替OMP估计
-            if ~isempty(detected_range) && abs(detected_range - prior_info.range) < range_diff
-                fprintf('使用CFAR距离(%.2f)替代OMP距离(%.2f)\n', detected_range, est_range);
-                est_range = detected_range;
-            else
-                % 没有可用的CFAR结果时，使用加权平均
-                weight = 0.75;  % 更偏向预测值
-                est_range = weight * prior_info.range + (1-weight) * est_range;
-                fprintf('应用距离加权平均校正: %.2f\n', est_range);
-            end
-        end
-        
-        % 检查并处理角度异常
-        if az_diff > az_threshold
-            measurement_anomaly = true;
-            fprintf('警告: 方位角估计与预测差异过大(%.2f > %.2f)，调整处理\n', az_diff, az_threshold);
+        el_diff = abs(est_elevation - prior_info.elevation);
 
-            % 方位角异常处理 - 自适应融合策略
-            az_trust_factor = max(0.2, min(0.5, 1.0 - az_diff/20.0));  % 自适应信任因子
-            weight = 1.0 - az_trust_factor;  % 预测值权重
-            est_azimuth = weight * prior_info.azimuth + az_trust_factor * est_azimuth;
-            fprintf('应用方位角自适应融合: %.2f (预测×%.2f + 测量×%.2f)\n', ...
-                    est_azimuth, weight, az_trust_factor);
-        end
-        
-        if el_diff > el_threshold
+        % 测量异常检测和处理
+        measurement_anomaly = false;
+        if range_diff > range_threshold || az_diff > az_threshold || el_diff > az_threshold
             measurement_anomaly = true;
-            fprintf('警告: 俯仰角估计与预测差异过大(%.2f > %.2f)，调整处理\n', el_diff, el_threshold);
-            
-            % 俯仰角异常处理 - 自适应融合策略
-            el_trust_factor = max(0.2, min(0.5, 1.0 - el_diff/20.0));  % 自适应信任因子
-            weight = 1.0 - el_trust_factor;  % 预测值权重
-            est_elevation = weight * prior_info.elevation + el_trust_factor * est_elevation;
-            fprintf('应用俯仰角自适应融合: %.2f (预测×%.2f + 测量×%.2f)\n', ...
-                    est_elevation, weight, el_trust_factor);
-        end
-        
-        % 调整测量噪声
-        if measurement_anomaly
-            % 创建临时测量噪声矩阵，根据异常程度动态调整
             temp_R = kf.params.R .* diag([
-                1 + min(1.5, range_diff/range_threshold), ...
-                1 + min(2.0, az_diff/az_threshold), ...
-                1 + min(2.0, el_diff/el_threshold)
+                1 + min(1.5, range_diff/range_threshold),
+                1 + min(2.0, az_diff/az_threshold),
+                1 + min(2.0, el_diff/az_threshold)
             ]);
-            
-            fprintf('调整测量噪声增益: [%.2f, %.2f, %.2f]\n', ...
-                temp_R(1,1)/kf.params.R(1,1), ...
-                temp_R(2,2)/kf.params.R(2,2), ...
-                temp_R(3,3)/kf.params.R(3,3));
         else
-            % 正常测量，进一步降低噪声以提高测量权重
             temp_R = kf.params.R .* diag([
-                max(0.7, min(1.1, range_diff/(0.3*range_threshold))), ...
-                max(0.7, min(1.1, az_diff/(0.3*az_threshold))), ...
-                max(0.7, min(1.1, el_diff/(0.3*el_threshold)))
+                max(0.7, min(1.1, range_diff/(0.3*range_threshold))),
+                max(0.7, min(1.1, az_diff/(0.3*az_threshold))),
+                max(0.7, min(1.1, el_diff/(0.3*az_threshold)))
             ]);
-            
-            % 如果测量与预测极为接近，进一步增强测量权重
-            if range_diff < 0.2 * range_threshold && ...
-               az_diff < 0.2 * az_threshold && ...
-               el_diff < 0.2 * el_threshold
-                temp_R = temp_R * 0.7;  % 显著降低测量噪声
-                fprintf('测量与预测极为接近，显著增强测量权重\n');
-            end
         end
-        
-        % 卡尔曼滤波更新 - 将测量结果与预测结果进行融合
-        % 更新测量值，使用可能经过修正的估计值
-        measurement = [est_range; est_azimuth; est_elevation];
-        
-        % 保存原始噪声矩阵以便恢复
+
+        % 保存原始噪声矩阵
         original_R = kf.params.R;
-        % 为UKF更新传递调整后的噪声协方差
         kf.params.R = temp_R;
-        
-        % 添加异常处理，防止单个帧的错误导致整个程序崩溃
+
+        % 更新测量值
+        measurement = [est_range; est_azimuth; est_elevation];
+
         try
-            % 状态更新前检查预测状态是否有异常
-            if any(isnan(predicted_state)) || any(isinf(predicted_state))
-                error('预测状态包含NaN或Inf值，可能需要重新初始化滤波器');
-            end
-            
-            % 使用更新后的测量值更新状态
+            % 使用UKF更新状态
             [updated_state, updated_P, ukf_params, NIS] = ukf_update(predicted_state, predicted_P, measurement, ukf_params);
-            
-            % NIS异常值检测
-            if NIS > 20.0  % 创新序列异常大
+
+            if NIS > 20.0
                 fprintf('警告: 创新序列异常大(NIS=%.2f)，可能表明滤波器发散\n', NIS);
-                
-                % 计算一个置信度因子，根据NIS大小调整状态更新
                 confidence = min(1.0, max(0.3, 20.0/NIS));
-                
-                % 调整更新：更新状态 = 置信度 * 更新状态 + (1-置信度) * 预测状态
-                corrected_state = confidence * updated_state + (1-confidence) * predicted_state;
-                
-                % 报告调整
+                updated_state = confidence * updated_state + (1-confidence) * predicted_state;
                 fprintf('应用状态校正，置信度=%.2f\n', confidence);
-                
-                % 保存调整后的状态
-                updated_state = corrected_state;
-                end
-                
-            % 应用物理约束以确保估计的合理性
-            % 确保距离非负
-            updated_state(1) = max(0.1, updated_state(1));
-            
-            % 限制角度在有效范围内
+            end
+
+            % 应用物理约束
+            updated_state(1) = max(0.1, updated_state(1));  % 距离非负
             updated_state(4) = wrapTo180(updated_state(4));  % 方位角
-            updated_state(7) = wrapTo180(updated_state(7));  % 俯仰角
-            
-            % 限制速度和加速度在合理范围内
-            max_vr = 40.0;  % 最大径向速度
-            max_ar = 20.0;  % 最大径向加速度
-            
-            if abs(updated_state(2)) > max_vr
-                updated_state(2) = sign(updated_state(2)) * max_vr;
-            end
-            
-            if abs(updated_state(3)) > max_ar
-                updated_state(3) = sign(updated_state(3)) * max_ar;
-            end
-            
+            updated_state(7) = max(-90, min(90, updated_state(7)));  % 俯仰角
+
             % 提取最终估计
             estimated_range = updated_state(1);
             estimated_velocity = updated_state(2);
@@ -424,27 +377,21 @@ for frame_idx = 1:num_frames
             estimated_elevation = updated_state(7);
             estimated_vel = updated_state(8);
             estimated_ael = updated_state(9);
-            
-            % 更新kf结构体
+
+            % 更新滤波器状态
             kf.x = updated_state;
             kf.P = updated_P;
             kf.params = ukf_params;
-            
-            % 恢复原始噪声矩阵，避免累积影响
             kf.params.R = original_R;
-            
-            % 记录创新序列用于显示
+
+            % 计算创新序列
             innovation = measurement - [updated_state(1); updated_state(4); updated_state(7)];
-            % 处理角度的周期性
-            innovation(2) = wrapTo180(innovation(2));
-            innovation(3) = wrapTo180(innovation(3));
-            
+            innovation(2:3) = wrapTo180(innovation(2:3));
+
         catch ME
-            % 发生错误时，回退到预测状态
             fprintf('错误发生在帧 %d 的更新阶段: %s\n', frame_idx, ME.message);
             fprintf('回退到预测状态以保证系统稳定性\n');
             
-            % 使用预测状态作为最终状态
             updated_state = predicted_state;
             estimated_range = predicted_state(1);
             estimated_velocity = predicted_state(2);
@@ -456,16 +403,14 @@ for frame_idx = 1:num_frames
             estimated_vel = predicted_state(8);
             estimated_ael = predicted_state(9);
             
-            % 设置虚拟创新序列
-            innovation = [0; 0; 0];
+            innovation = zeros(3, 1);
             NIS = 0;
             
-            % 恢复原始噪声矩阵
             kf.params.R = original_R;
         end
     end
     
-    % 显示创新序列和马氏距离(NIS)
+    % 显示创新序列和NIS
     fprintf('创新序列: 距离=%.2f m, 方位角=%.2f°, 俯仰角=%.2f°, NIS=%.2f\n', ...
         innovation(1), innovation(2), innovation(3), NIS);
     
@@ -492,7 +437,7 @@ for frame_idx = 1:num_frames
             azimuth, estimated_azimuth, az_error);
     fprintf('俯仰角: 真实=%.2f°, 估计=%.2f°, 误差=%.2f°\n', ...
             elevation, estimated_elevation, el_error);
-        
+    
     % 可视化当前结果
     if mod(frame_idx, params.viz.update_interval) == 0
         visualize_tracking(results(1:frame_idx), params);
@@ -509,6 +454,10 @@ end
 
 total_time = toc(total_timer);
 fprintf('\n处理完成。总耗时: %.1f 分钟\n', total_time/60);
+
+% 筛选有效数据用于评估
+valid_frames = sum(arrayfun(@(x) ~isempty(x.true) && ~isempty(x.est), results));
+fprintf('总共 %d 帧中有 %d 帧有效数据用于评估\n', num_frames, valid_frames);
 
 %% 结果评估
 try
